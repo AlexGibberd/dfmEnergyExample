@@ -1,0 +1,234 @@
+---
+title: "Smart Meter DFM Example"
+author: "Alex Gibberd"
+date: "2023-03-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+This document enables replication of the smart-meter application in ["The Sparse Dynamic Factor Model: A Regularised Quasi-Maximum Likelihood Approach"](https://arxiv.org), by Luke Mosley, Tak-Shing T. Chan and Alex Gibberd.
+
+
+## Setup
+
+For anonymity we provide the time-series of smart meter data labelled at the building type level. This is a subset of data collected over November 2020. 
+
+This example utilises the `sparseDFM` R package, available via CRAN or via [Github](https://github.com/mosleyl/sparseDFM). We use `BigVAR` to estimate and tune the sparse VAR model as a comparison.
+
+```{r}
+source("functions.R")
+load("data.RData")
+library(sparseDFM)
+library(BigVAR)
+```
+
+
+## Estimation 
+
+We will first do some exploratory analysis to determine an appropriate size of model.
+
+
+```{r}
+# sparseDFM can use time-series objects to plot relevant xaxis
+dayobs = 144 # observations/day
+data.anon.ts = ts(data.anon, start=0, frequency=dayobs)
+```
+
+The below replicates Figure 5. in the paper
+```{r}
+series = c(1,16,19,28,31,33)
+plot(data.anon.ts[,series], xlab="days", ylab=colnames(data.anon)[series],main="")
+```
+
+We now use the Information Criteria of Bai to suggest a number of factors to use.
+
+```{r}
+tuneFactors(data.anon.ts,type=2)
+```
+
+As presented in the paper, the criteria suggests to choose 4 factors. We proceed on this basis. Note, other IC criteria in Bai et al give simillar number of factors.
+
+We compare the sparse DFM with a regular DFM ($\alpha=0$).
+
+```{r}
+# Estimate regular (exact) DFM
+mod0 = sparseDFM(data.anon.ts, r=4, q = 0,
+                alg = "EM",
+                err = "IID",
+                kalman = "univariate",
+                store.parameters = TRUE,
+                standardize = TRUE,
+                max_iter = 100,
+                threshold = 1e-04)
+
+```
+
+
+```{r}
+# Estimate sparse DFM (across range of alphas)
+mod = sparseDFM(data.anon.ts, r=4, q = 0,
+                alphas = logspace(-3, -1, 100),
+                alg = "EM-sparse",
+                err = "IID",
+                kalman = "univariate",
+                store.parameters = TRUE,
+                standardize = TRUE,
+                max_iter = 100,
+                threshold = 1e-04)
+
+```
+
+## Interpretation
+
+```{r}
+# Plot the BIC values for each alpha 
+plot(mod, type = 'lasso.bic')
+```
+
+```{r}
+# The best alpha chosen 
+mod$em$alpha_opt
+optidx = which(mod$em$alpha_grid==mod$em$alpha_opt)
+
+# Below is where the second dip appears in BIC curve
+optidx2 = optidx + 21
+```
+
+_Note: The examples below are based on optidx2, however, there is not much difference in the lambda structure in this application, i.e. as a function of alpha. For other examples where the structure varies more considerably see Mosley et al 2023._
+
+A comparison of the loadings can be seen below.
+```{r}
+plot(mod, type = 'loading.heatmap', use.series.names = TRUE, alpha_index=optidx2)
+```
+```{r}
+plot(mod0, type = 'loading.heatmap', use.series.names = TRUE)
+```
+
+We can also visualise the estimated factors, e.g. based on the expectation step of our EM algorithm. First for the sparse DFM, then for the regular DFM.
+```{r}
+plot(mod, type = 'factor', alpha_index=optidx2)
+```
+
+```{r}
+plot(mod0, type = 'factor')
+```
+
+
+## Forecasting
+
+The code below replicates the 1 hour ahead forecast examples found in the paper. You can also assess the forecasts for other buildings if desired.
+
+```{r}
+
+# Steps ahead (each step is 10 minutes)
+h = 6
+ntest = dim(data_test.anon)[1]
+# sparse DFM Forecast
+forecast1 = stepForecast(mod,data.anon,data_test.anon,h)
+# AR(1) Forecast
+forecast2 = arimaForecast(data.anon,data_test.anon,p=1,q=0,h)
+
+```
+
+For the SVAR forecast, it may be useful to use the pre-calculate optimal lambda rather than running the `BigVar` cross-validation scheme, which takes considerable time.
+
+```{r,eval=FALSE}
+## TAKES A LONG TIME TO RUN, CAN USE PRECALCULATED LAMBDA
+lambdaGridSVAR = sparseDFM::logspace(-1,1.3,20)
+
+svar.mod <- constructModel(as.matrix(fillNA2(data.anon)),
+                           p=1,"Basic",gran=lambdaGridSVAR,
+                           h=1,
+                           cv="Rolling",
+                           verbose=FALSE,
+                           ownlambdas = TRUE,
+                           IC=TRUE,
+                           model.controls=list(intercept=TRUE))
+
+results = cv.BigVAR(svar.mod)
+lambdaopt = results@OptimalLambda
+```
+
+```{r}
+# Below derived from cv on training data.
+lambdaopt = 1.62377
+```
+
+```{r}
+forecast3 = svarForecast(lambdaopt,data.anon,data_test.anon, h)
+```
+
+```{r}
+
+# For the specific example in the paper we use
+# the following  buidling
+id = 5
+
+
+len = (ntest-h)
+mu = forecast1$Xhat[1:len,id]
+true = data_test.anon[(h+1):ntest,id]
+cl = mu[1:len]-1.96*sqrt(forecast1$XCov[1:len,id,id])
+cu = mu[1:len]+1.96*sqrt(forecast1$XCov[1:len,id,id])
+building = "Accomodation"
+xt = seq((h/6),24-(1/6),1/6)
+par(mfrow=c(1,3))
+
+# Plot DFM Forecast
+
+plot(xt, mu, lty=1, col="blue", type="l", 
+     ylim=c(min(cl),max(cu)), 
+     ylab=paste(building,"Consumption (kWh)"),
+     xlab="Time of Day (hours)")
+lines(xt, true, lty=2, col="red")
+lines(xt, cl, lty=3)
+lines(xt, cu, lty=3)
+
+
+# Plot AR Forecast
+
+mu2 = forecast2[1:len,id]
+plot(xt, mu2, lty=1, col="blue", type="l", 
+     ylim=c(min(cl),max(cu)), 
+     ylab=paste(building,"Consumption (kWh)"),
+     xlab="Time of Day (hours)")
+lines(xt, true, lty=2, col="red")
+
+# Plot SVAR Forecast
+
+mu3 = forecast3[1:len,id]
+plot(xt, mu3, lty=1, col="blue", type="l", 
+     ylim=c(min(cl),max(cu)), 
+     ylab=paste(building,"Consumption (kWh)"),
+     xlab="Time of Day (hours)")
+lines(xt, true, lty=2, col="red")
+```
+
+We can now evaluate the forecast performance over one (weekday) of data.
+```{r}
+type="MAPE"
+errorDFM = evalForecast(forecast1$Xhat[1:len,],data_test.anon[(h+1):ntest,],type)
+errorAR = evalForecast(forecast2[1:len,],data_test.anon[(h+1):ntest,],type)
+errorSVAR = evalForecast(forecast3[1:len,],data_test.anon[(h+1):ntest,],type)
+```
+
+```{r}
+# Find winner for each series
+winner = apply(cbind(errorDFM,errorAR,errorSVAR),1,which.min)
+cols = c("blue","red","navy")
+```
+
+```{r}
+par(mfrow=c(1,3))
+maxerr = round(max(c(errorDFM,errorAR,errorSVAR)),1)
+barplot(errorDFM, col=cols[winner], ylab=paste0("sDFM Error (",type,")"),ylim=c(0,maxerr) )
+abline(h=mean(errorDFM))
+barplot(errorAR,col=cols[winner], ylab=paste0("AR Error (",type,")"),ylim=c(0,maxerr))
+abline(h=mean(errorAR))
+barplot(errorSVAR,col=cols[winner], ylab=paste0("sVAR Error (",type,")"),ylim=c(0,maxerr))
+abline(h=mean(errorSVAR))
+```
